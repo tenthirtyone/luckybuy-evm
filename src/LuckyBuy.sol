@@ -17,39 +17,48 @@ contract LuckyBuy is
     SignatureVerifier,
     ReentrancyGuard
 {
+    // ============ Constants ============
+    uint256 public constant MIN_COMMIT_EXPIRE_TIME = 1 minutes;
+    uint256 public constant ONE_PERCENT = 100;
+    uint256 public constant BASE_POINTS = 10000;
+
+    // ============ External Contracts ============
     IPRNG public PRNG;
     address payable public feeReceiver;
+
+    // ============ Open Edition Configuration ============
     // We will not track our supply on this contract. We will mint a yuge amount and never run out on the oe.
     address public openEditionToken;
     uint256 public openEditionTokenId;
     // The OE interface forces us to use uint32
     uint32 public openEditionTokenAmount;
 
+    // ============ Commit Storage ============
     CommitData[] public luckyBuys;
     mapping(bytes32 commitDigest => uint256 commitId) public commitIdByDigest;
+    mapping(uint256 commitId => uint256 expiresAt) public commitExpiresAt;
+    mapping(uint256 commitId => bool fulfilled) public isFulfilled;
+    mapping(uint256 commitId => bool expired) public isExpired;
+    mapping(uint256 commitId => uint256 fee) public feesPaid;
 
+    // ============ Balance Tracking ============
     uint256 public treasuryBalance; // The contract balance
     uint256 public commitBalance; // The open commit balances
     uint256 public protocolBalance; // The protocol fees for the open commits
+
+    // ============ Configuration ============
     uint256 public maxReward = 50 ether;
     uint256 public protocolFee = 0;
     uint256 public minReward = BASE_POINTS;
     uint256 public flatFee = 0;
-
     uint256 public commitExpireTime = 1 days;
-    mapping(uint256 commitId => uint256 expiresAt) public commitExpiresAt;
 
-    uint256 public constant MIN_COMMIT_EXPIRE_TIME = 1 minutes;
-    uint256 public constant ONE_PERCENT = 100;
-    uint256 public constant BASE_POINTS = 10000;
-
+    // ============ User Tracking ============
     mapping(address cosigner => bool active) public isCosigner;
     mapping(address receiver => uint256 counter) public luckyBuyCount;
-    mapping(uint256 commitId => bool fulfilled) public isFulfilled;
-    mapping(uint256 commitId => bool expired) public isExpired;
-    // We track this because we can change the fees at any time. This allows open commits to be fulfilled/returned with the fees at the time of commit
-    mapping(uint256 commitId => uint256 fee) public feesPaid;
 
+    // ============ Commit Events ============
+    /// @notice Emitted when a new commit is created
     event Commit(
         address indexed sender,
         uint256 indexed commitId,
@@ -64,49 +73,30 @@ contract LuckyBuy is
         uint256 flatFee,
         bytes32 digest
     );
-    event CosignerAdded(address indexed cosigner);
-    event CosignerRemoved(address indexed cosigner);
+
+    /// @notice Emitted when a commit is fulfilled
     event Fulfillment(
-        address indexed sender,
         uint256 indexed commitId,
+        address indexed receiver,
+        address indexed cosigner,
+        uint256 commitAmount,
+        uint256 orderAmount,
+        address token,
+        uint256 tokenId,
         uint256 rng,
         uint256 odds,
         bool win,
-        address token,
-        uint256 tokenId,
-        uint256 amount,
-        address receiver,
-        uint256 fee,
+        bool orderSuccess,
+        uint256 protocolFee,
+        uint256 flatFee,
         bytes32 digest
     );
-    event MaxRewardUpdated(uint256 oldMaxReward, uint256 newMaxReward);
-    event ProtocolFeeUpdated(uint256 oldProtocolFee, uint256 newProtocolFee);
-    event Withdrawal(
-        address indexed sender,
-        uint256 amount,
-        address feeReceiver
-    );
-    event Deposit(address indexed sender, uint256 amount);
-    event MinRewardUpdated(uint256 oldMinReward, uint256 newMinReward);
-    event CommitExpireTimeUpdated(
-        uint256 oldCommitExpireTime,
-        uint256 newCommitExpireTime
-    );
+
+    /// @notice Emitted when a commit expires
     event CommitExpired(uint256 indexed commitId, bytes32 digest);
-    event OpenEditionTokenSet(
-        address indexed token,
-        uint256 indexed tokenId,
-        uint256 amount
-    );
-    event FlatFeeUpdated(uint256 oldFlatFee, uint256 newFlatFee);
-    event FeeReceiverUpdated(
-        address indexed oldFeeReceiver,
-        address indexed newFeeReceiver
-    );
-    event OpenEditionContractTransferred(
-        address indexed oldOwner,
-        address indexed newOwner
-    );
+
+    // ============ Fee Events ============
+    /// @notice Emitted when protocol fees are split
     event FeeSplit(
         uint256 indexed commitId,
         address indexed feeSplitReceiver,
@@ -114,39 +104,131 @@ contract LuckyBuy is
         uint256 totalProtocolFee,
         uint256 splitAmount
     );
+
+    /// @notice Emitted when a fee transfer fails
     event FeeTransferFailure(
         uint256 indexed commitId,
         address indexed feeSplitReceiver,
         uint256 amount,
         bytes32 digest
     );
+
+    /// @notice Emitted when protocol fee is updated
+    event ProtocolFeeUpdated(uint256 oldProtocolFee, uint256 newProtocolFee);
+
+    /// @notice Emitted when flat fee is updated
+    event FlatFeeUpdated(uint256 oldFlatFee, uint256 newFlatFee);
+
+    /// @notice Emitted when fee receiver is updated
+    event FeeReceiverUpdated(
+        address indexed oldFeeReceiver,
+        address indexed newFeeReceiver
+    );
+
+    /// @notice Emitted when fee receiver manager is transferred
     event FeeReceiverManagerTransferred(
         address indexed oldFeeReceiverManager,
         address indexed newFeeReceiverManager
     );
 
-    error AlreadyCosigner();
+    // ============ Balance Events ============
+    /// @notice Emitted when funds are withdrawn
+    event Withdrawal(
+        address indexed sender,
+        uint256 amount,
+        address feeReceiver
+    );
+
+    /// @notice Emitted when funds are deposited
+    event Deposit(address indexed sender, uint256 amount);
+
+    // ============ Configuration Events ============
+    /// @notice Emitted when max reward is updated
+    event MaxRewardUpdated(uint256 oldMaxReward, uint256 newMaxReward);
+
+    /// @notice Emitted when min reward is updated
+    event MinRewardUpdated(uint256 oldMinReward, uint256 newMinReward);
+
+    /// @notice Emitted when commit expire time is updated
+    event CommitExpireTimeUpdated(
+        uint256 oldCommitExpireTime,
+        uint256 newCommitExpireTime
+    );
+
+    // ============ Open Edition Events ============
+    /// @notice Emitted when open edition token is set
+    event OpenEditionTokenSet(
+        address indexed token,
+        uint256 indexed tokenId,
+        uint256 amount
+    );
+
+    /// @notice Emitted when open edition contract ownership is transferred
+    event OpenEditionContractTransferred(
+        address indexed oldOwner,
+        address indexed newOwner
+    );
+
+    // ============ Cosigner Events ============
+    /// @notice Emitted when a cosigner is added
+    event CosignerAdded(address indexed cosigner);
+
+    /// @notice Emitted when a cosigner is removed
+    event CosignerRemoved(address indexed cosigner);
+
+    // ============ Commit Errors ============
+    /// @notice Thrown when attempting to fulfill an already fulfilled commit
     error AlreadyFulfilled();
-    error InsufficientBalance();
-    error InvalidAmount();
-    error InvalidCommitOwner();
-    error InvalidCosigner();
-    error InvalidOrderHash();
-    error InvalidProtocolFee();
-    error InvalidReceiver();
-    error InvalidReward();
-    error FulfillmentFailed();
-    error InvalidCommitId();
-    error WithdrawalFailed();
-    error InvalidCommitExpireTime();
-    error CommitIsExpired();
+    /// @notice Thrown when attempting to expire a commit that is not expired
     error CommitNotExpired();
-    error TransferFailed();
+    /// @notice Thrown when attempting to interact with an expired commit
+    error CommitIsExpired();
+    /// @notice Thrown when attempting to interact with an invalid commit ID
+    error InvalidCommitId();
+    /// @notice Thrown when attempting to interact with a commit owned by another address
+    error InvalidCommitOwner();
+
+    // ============ Fee Errors ============
+    /// @notice Thrown when attempting to set an invalid protocol fee
+    error InvalidProtocolFee();
+    /// @notice Thrown when attempting to set an invalid fee receiver
     error InvalidFeeReceiver();
+    /// @notice Thrown when attempting to set an invalid fee split receiver
     error InvalidFeeSplitReceiver();
+    /// @notice Thrown when attempting to set an invalid fee split percentage
     error InvalidFeeSplitPercentage();
+    /// @notice Thrown when attempting to set an invalid fee receiver manager
     error InvalidFeeReceiverManager();
 
+    // ============ Cosigner Errors ============
+    /// @notice Thrown when attempting to add an already registered cosigner
+    error AlreadyCosigner();
+    /// @notice Thrown when attempting to interact with an invalid cosigner
+    error InvalidCosigner();
+
+    // ============ Balance Errors ============
+    /// @notice Thrown when attempting to withdraw more than available balance
+    error InsufficientBalance();
+    /// @notice Thrown when a withdrawal operation fails
+    error WithdrawalFailed();
+    /// @notice Thrown when a transfer operation fails
+    error TransferFailed();
+
+    // ============ Configuration Errors ============
+    /// @notice Thrown when attempting to set an invalid amount
+    error InvalidAmount();
+    /// @notice Thrown when attempting to set an invalid receiver
+    error InvalidReceiver();
+    /// @notice Thrown when attempting to set an invalid reward
+    error InvalidReward();
+    /// @notice Thrown when attempting to set an invalid commit expire time
+    error InvalidCommitExpireTime();
+    /// @notice Thrown when attempting to set an invalid order hash
+    error InvalidOrderHash();
+    /// @notice Thrown when a fulfillment operation fails
+    error FulfillmentFailed();
+
+    // ============ Modifiers ============
     modifier onlyCommitOwnerOrCosigner(uint256 commitId_) {
         if (
             luckyBuys[commitId_].receiver != msg.sender &&
@@ -155,6 +237,7 @@ contract LuckyBuy is
         _;
     }
 
+    // ============ Constructor ============
     /// @notice Constructor initializes the contract and handles any pre-existing balance
     /// @dev Sets up EIP712 domain separator and deposits any ETH sent during deployment
     constructor(
@@ -176,6 +259,7 @@ contract LuckyBuy is
         _grantRole(FEE_RECEIVER_MANAGER_ROLE, feeReceiverManager_);
     }
 
+    // ============ Core Commit Functions ============
     /// @notice Allows a user to commit funds for a chance to win
     /// @param receiver_ Address that will receive the NFT/ETH if won
     /// @param cosigner_ Address of the authorized cosigner
@@ -264,6 +348,40 @@ contract LuckyBuy is
         return commitId;
     }
 
+    /// @notice Allows the commit owner to expire a commit in the event that the commit is not or cannot be fulfilled
+    /// @param commitId_ ID of the commit to expire
+    /// @dev Only callable by the commit owner
+    /// @dev Emits a CommitExpired event
+    function expire(
+        uint256 commitId_
+    ) external onlyCommitOwnerOrCosigner(commitId_) nonReentrant {
+        if (commitId_ >= luckyBuys.length) revert InvalidCommitId();
+        if (isFulfilled[commitId_]) revert AlreadyFulfilled();
+        if (isExpired[commitId_]) revert CommitIsExpired();
+        if (block.timestamp < commitExpiresAt[commitId_])
+            revert CommitNotExpired();
+
+        isExpired[commitId_] = true;
+
+        CommitData memory commitData = luckyBuys[commitId_];
+
+        uint256 commitAmount = commitData.amount;
+        commitBalance -= commitAmount;
+
+        uint256 protocolFeesPaid = feesPaid[commitId_];
+        protocolBalance -= protocolFeesPaid;
+
+        uint256 transferAmount = commitAmount + protocolFeesPaid;
+
+        (bool success, ) = payable(commitData.receiver).call{
+            value: transferAmount
+        }("");
+        if (!success) revert TransferFailed();
+
+        emit CommitExpired(commitId_, hash(commitData));
+    }
+
+    // ============ Fulfillment Functions ============
     /// @notice Fulfills a commit with the result of the random number generation
     /// @param commitId_ ID of the commit to fulfill
     /// @param marketplace_ Address where the order should be executed
@@ -293,7 +411,7 @@ contract LuckyBuy is
         );
     }
 
-    /// @notice Fulfills a commit with the result of the random number generation
+    /// @notice Fulfills a commit with the result of the random number generation and splits fees
     /// @param commitId_ ID of the commit to fulfill
     /// @param marketplace_ Address where the order should be executed
     /// @param orderData_ Calldata for the order execution
@@ -363,6 +481,330 @@ contract LuckyBuy is
         );
     }
 
+    /// @notice Fulfills a commit by its digest
+    /// @param commitDigest_ Digest of the commit to fulfill
+    /// @param marketplace_ Address where the order should be executed
+    /// @param orderData_ Calldata for the order execution
+    /// @param orderAmount_ Amount of ETH to send with the order
+    /// @param token_ Address of the token being transferred (zero address for ETH)
+    /// @param tokenId_ ID of the token if it's an NFT
+    /// @param signature_ Signature used for random number generation
+    /// @dev Emits a Fulfillment event on success
+    function fulfillByDigest(
+        bytes32 commitDigest_,
+        address marketplace_,
+        bytes calldata orderData_,
+        uint256 orderAmount_,
+        address token_,
+        uint256 tokenId_,
+        bytes calldata signature_
+    ) public payable whenNotPaused {
+        return
+            fulfill(
+                commitIdByDigest[commitDigest_],
+                marketplace_,
+                orderData_,
+                orderAmount_,
+                token_,
+                tokenId_,
+                signature_
+            );
+    }
+
+    /// @notice Fulfills a commit by its digest with fee splitting
+    /// @param commitDigest_ Digest of the commit to fulfill
+    /// @param marketplace_ Address where the order should be executed
+    /// @param orderData_ Calldata for the order execution
+    /// @param orderAmount_ Amount of ETH to send with the order
+    /// @param token_ Address of the token being transferred (zero address for ETH)
+    /// @param tokenId_ ID of the token if it's an NFT
+    /// @param signature_ Signature used for random number generation
+    /// @param feeSplitReceiver_ Address of the fee split receiver
+    /// @param feeSplitPercentage_ Percentage of the fee to split relative to the protocol fees paid
+    /// @dev Emits a FeeSplit event on success
+    function fulfillByDigestWithFeeSplit(
+        bytes32 commitDigest_,
+        address marketplace_,
+        bytes calldata orderData_,
+        uint256 orderAmount_,
+        address token_,
+        uint256 tokenId_,
+        bytes calldata signature_,
+        address feeSplitReceiver_,
+        uint256 feeSplitPercentage_
+    ) public payable whenNotPaused {
+        return
+            fulfillWithFeeSplit(
+                commitIdByDigest[commitDigest_],
+                marketplace_,
+                orderData_,
+                orderAmount_,
+                token_,
+                tokenId_,
+                signature_,
+                feeSplitReceiver_,
+                feeSplitPercentage_
+            );
+    }
+
+    // ============ Balance Management Functions ============
+    /// @notice Allows the admin to withdraw ETH from the contract balance
+    /// @param amount The amount of ETH to withdraw
+    /// @dev Only callable by admin role
+    /// @dev Emits a Withdrawal event
+    function withdraw(
+        uint256 amount
+    ) external nonReentrant onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (amount > treasuryBalance) revert InsufficientBalance();
+        treasuryBalance -= amount;
+
+        (bool success, ) = payable(feeReceiver).call{value: amount}("");
+        if (!success) revert WithdrawalFailed();
+
+        emit Withdrawal(msg.sender, amount, feeReceiver);
+    }
+
+    /// @notice Allows the admin to withdraw all ETH from the contract
+    /// @dev Only callable by admin role
+    /// @dev Emits a Withdrawal event
+    function emergencyWithdraw()
+        external
+        nonReentrant
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        treasuryBalance = 0;
+        commitBalance = 0;
+        protocolBalance = 0;
+
+        uint256 currentBalance = address(this).balance;
+
+        (bool success, ) = payable(feeReceiver).call{value: currentBalance}("");
+        if (!success) revert WithdrawalFailed();
+
+        _pause();
+        emit Withdrawal(msg.sender, currentBalance, feeReceiver);
+    }
+
+    // ============ Configuration Management Functions ============
+    /// @notice Sets the commit expire time
+    /// @param commitExpireTime_ New commit expire time
+    /// @dev Only callable by admin role
+    /// @dev Emits a CommitExpireTimeUpdated event
+    function setCommitExpireTime(
+        uint256 commitExpireTime_
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (commitExpireTime_ < MIN_COMMIT_EXPIRE_TIME)
+            revert InvalidCommitExpireTime();
+        uint256 oldCommitExpireTime = commitExpireTime;
+        commitExpireTime = commitExpireTime_;
+        emit CommitExpireTimeUpdated(oldCommitExpireTime, commitExpireTime_);
+    }
+
+    /// @notice Sets the maximum allowed reward
+    /// @param maxReward_ New maximum reward value
+    /// @dev Only callable by ops role
+    function setMaxReward(uint256 maxReward_) external onlyRole(OPS_ROLE) {
+        if (maxReward_ < minReward) revert InvalidReward();
+
+        uint256 oldMaxReward = maxReward;
+        maxReward = maxReward_;
+        emit MaxRewardUpdated(oldMaxReward, maxReward_);
+    }
+
+    /// @notice Sets the minimum allowed reward
+    /// @param minReward_ New minimum reward value
+    /// @dev Only callable by admin role
+    function setMinReward(
+        uint256 minReward_
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (minReward_ > maxReward) revert InvalidReward();
+        if (minReward_ < BASE_POINTS) revert InvalidReward();
+
+        uint256 oldMinReward = minReward;
+        minReward = minReward_;
+
+        emit MinRewardUpdated(oldMinReward, minReward_);
+    }
+
+    /// @notice Sets the protocol fee
+    /// @param protocolFee_ New protocol fee value
+    /// @dev Only callable by ops role
+    function setProtocolFee(uint256 protocolFee_) external onlyRole(OPS_ROLE) {
+        _setProtocolFee(protocolFee_);
+    }
+
+    /// @notice Sets the flat fee
+    /// @param flatFee_ New flat fee value
+    /// @dev Only callable by ops role
+    /// @dev Emits a FlatFeeUpdated event
+    function setFlatFee(uint256 flatFee_) external onlyRole(OPS_ROLE) {
+        _setFlatFee(flatFee_);
+    }
+
+    // ============ Fee Receiver Management Functions ============
+    /// @notice Transfers the fee receiver manager role
+    /// @param newFeeReceiverManager_ New fee receiver manager address
+    /// @dev Only callable by fee receiver manager role
+    function transferFeeReceiverManager(
+        address newFeeReceiverManager_
+    ) external onlyRole(FEE_RECEIVER_MANAGER_ROLE) {
+        if (newFeeReceiverManager_ == address(0))
+            revert InvalidFeeReceiverManager();
+        _transferFeeReceiverManager(newFeeReceiverManager_);
+    }
+
+    /// @notice Sets the fee receiver
+    /// @param feeReceiver_ Address to set as fee receiver
+    /// @dev Only callable by fee receiver manager role
+    /// @dev Emits a FeeReceiverUpdated event
+    function setFeeReceiver(
+        address feeReceiver_
+    ) external onlyRole(FEE_RECEIVER_MANAGER_ROLE) {
+        _setFeeReceiver(feeReceiver_);
+    }
+
+    // ============ Open Edition Management Functions ============
+    /// @notice Transfers ownership of the open edition contract
+    /// @param newOwner New owner address
+    /// @dev Only callable by admin role
+    function transferOpenEditionContractOwnership(
+        address newOwner
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        address oldOwner = IERC1155MInitializableV1_0_2(openEditionToken)
+            .owner();
+        IERC1155MInitializableV1_0_2(openEditionToken).transferOwnership(
+            newOwner
+        );
+
+        _setOpenEditionToken(
+            openEditionToken,
+            openEditionTokenId,
+            openEditionTokenAmount
+        );
+
+        emit OpenEditionContractTransferred(oldOwner, newOwner);
+    }
+
+    /// @notice Sets the open edition token
+    /// @param token_ Address of the open edition token
+    /// @param tokenId_ ID of the open edition token
+    /// @param amount_ Amount of the open edition token
+    /// @dev Only callable by ops role
+    function setOpenEditionToken(
+        address token_,
+        uint256 tokenId_,
+        uint32 amount_
+    ) external onlyRole(OPS_ROLE) {
+        _setOpenEditionToken(token_, tokenId_, amount_);
+    }
+
+    // ============ Cosigner Management Functions ============
+    /// @notice Adds a new authorized cosigner
+    /// @param cosigner_ Address to add as cosigner
+    /// @dev Only callable by admin role
+    /// @dev Emits a CoSignerAdded event
+    function addCosigner(
+        address cosigner_
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (cosigner_ == address(0)) revert InvalidCosigner();
+        if (isCosigner[cosigner_]) revert AlreadyCosigner();
+        isCosigner[cosigner_] = true;
+        emit CosignerAdded(cosigner_);
+    }
+
+    /// @notice Removes an authorized cosigner
+    /// @param cosigner_ Address to remove as cosigner
+    /// @dev Only callable by admin role
+    /// @dev Emits a CoSignerRemoved event
+    function removeCosigner(
+        address cosigner_
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (!isCosigner[cosigner_]) revert InvalidCosigner();
+        isCosigner[cosigner_] = false;
+        emit CosignerRemoved(cosigner_);
+    }
+
+    // ============ Pause Management Functions ============
+    /// @notice Pauses the contract
+    /// @dev Only callable by admin role
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
+    }
+
+    /// @notice Unpauses the contract
+    /// @dev Only callable by admin role
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
+    }
+
+    // ============ Internal Functions ============
+    /// @notice Internal function to handle win conditions
+    /// @param commitData The commit data
+    /// @param marketplace_ Address where the order should be executed
+    /// @param orderData_ Calldata for the order execution
+    /// @param orderAmount_ Amount of ETH to send with the order
+    /// @param rng_ Random number generated
+    /// @param odds_ Calculated odds
+    /// @param win_ Whether the commit won
+    /// @param token_ Address of the token being transferred
+    /// @param tokenId_ ID of the token if it's an NFT
+    /// @param protocolFeesPaid Protocol fees paid
+    /// @param digest Commit digest
+    function _handleWin(
+        CommitData memory commitData,
+        address marketplace_,
+        bytes calldata orderData_,
+        uint256 orderAmount_,
+        uint256 rng_,
+        uint256 odds_,
+        bool win_,
+        address token_,
+        uint256 tokenId_,
+        uint256 protocolFeesPaid,
+        bytes32 digest
+    ) internal {
+        // execute the market data to transfer the nft
+        bool success = _fulfillOrder(marketplace_, orderData_, orderAmount_);
+        if (success) {
+            // subtract the order amount from the contract balance
+            treasuryBalance -= orderAmount_;
+        } else {
+            // The order failed to fulfill, it could be bought already or invalid, make the best effort to send the user the value of the order they won.
+            treasuryBalance -= orderAmount_;
+
+            // This can also revert if the receiver is a contract that doesn't accept ETH
+            (bool success, ) = commitData.receiver.call{value: orderAmount_}(
+                ""
+            );
+            if (!success) revert TransferFailed();
+        }
+
+        emit Fulfillment(
+            commitData.id,
+            commitData.receiver,
+            commitData.cosigner,
+            commitData.amount,
+            orderAmount_,
+            token_,
+            tokenId_,
+            rng_,
+            odds_,
+            win_,
+            success,
+            protocolFeesPaid,
+            flatFee,
+            digest
+        );
+    }
+
+    /// @notice Internal function to fulfill a commit
+    /// @param commitId_ ID of the commit to fulfill
+    /// @param marketplace_ Address where the order should be executed
+    /// @param orderData_ Calldata for the order execution
+    /// @param orderAmount_ Amount of ETH to send with the order
+    /// @param token_ Address of the token being transferred (zero address for ETH)
+    /// @param tokenId_ ID of the token if it's an NFT
+    /// @param signature_ Signature used for random number generation
     function _fulfill(
         uint256 commitId_,
         address marketplace_,
@@ -440,273 +882,79 @@ contract LuckyBuy is
             }
             // emit the failure
             emit Fulfillment(
-                msg.sender,
                 commitId_,
+                commitData.receiver,
+                commitData.cosigner,
+                commitData.amount,
+                orderAmount_,
+                token_,
+                tokenId_,
                 rng,
                 odds,
                 win,
-                address(0),
-                0,
-                0,
-                commitData.receiver,
+                false, // orderSuccess
                 protocolFeesPaid,
+                flatFee,
                 digest
             );
         }
     }
 
-    /// @notice Fulfills a commit with the result of the random number generation
-    /// @param commitDigest_ Digest of the commit to fulfill
-    /// @param marketplace_ Address where the order should be executed
-    /// @param orderData_ Calldata for the order execution
-    /// @param orderAmount_ Amount of ETH to send with the order
-    /// @param token_ Address of the token being transferred (zero address for ETH)
-    /// @param tokenId_ ID of the token if it's an NFT
-    /// @param signature_ Signature used for random number generation
-    /// @dev Emits a Fulfillment event on success
-    function fulfillByDigest(
-        bytes32 commitDigest_,
-        address marketplace_,
-        bytes calldata orderData_,
-        uint256 orderAmount_,
-        address token_,
-        uint256 tokenId_,
-        bytes calldata signature_
-    ) public payable whenNotPaused {
-        return
-            fulfill(
-                commitIdByDigest[commitDigest_],
-                marketplace_,
-                orderData_,
-                orderAmount_,
-                token_,
-                tokenId_,
-                signature_
-            );
+    /// @notice Internal function to fulfill an order
+    /// @param to Address to send the transaction to
+    /// @param data Calldata for the transaction
+    /// @param amount Amount of ETH to send
+    /// @return success Whether the transaction was successful
+    function _fulfillOrder(
+        address to,
+        bytes calldata data,
+        uint256 amount
+    ) internal returns (bool success) {
+        (success, ) = to.call{value: amount}(data);
     }
 
-    /// @notice Fulfills a commit with the result of the random number generation
-    /// @param commitDigest_ Digest of the commit to fulfill
-    /// @param marketplace_ Address where the order should be executed
-    /// @param orderData_ Calldata for the order execution
-    /// @param orderAmount_ Amount of ETH to send with the order
-    /// @param token_ Address of the token being transferred (zero address for ETH)
-    /// @param tokenId_ ID of the token if it's an NFT
-    /// @param signature_ Signature used for random number generation
-    /// @dev Emits a Fulfillment event on success
-    function fulfillByDigestWithFeeSplit(
-        bytes32 commitDigest_,
-        address marketplace_,
-        bytes calldata orderData_,
-        uint256 orderAmount_,
-        address token_,
-        uint256 tokenId_,
-        bytes calldata signature_,
-        address feeSplitReceiver_,
-        uint256 feeSplitPercentage_
-    ) public payable whenNotPaused {
-        return
-            fulfillWithFeeSplit(
-                commitIdByDigest[commitDigest_],
-                marketplace_,
-                orderData_,
-                orderAmount_,
-                token_,
-                tokenId_,
-                signature_,
-                feeSplitReceiver_,
-                feeSplitPercentage_
-            );
+    /// @notice Internal function to set the protocol fee
+    /// @param protocolFee_ New protocol fee value
+    function _setProtocolFee(uint256 protocolFee_) internal {
+        if (protocolFee_ > BASE_POINTS) revert InvalidProtocolFee();
+        uint256 oldProtocolFee = protocolFee;
+        protocolFee = protocolFee_;
+        emit ProtocolFeeUpdated(oldProtocolFee, protocolFee_);
     }
 
-    function _handleWin(
-        CommitData memory commitData,
-        address marketplace_,
-        bytes calldata orderData_,
-        uint256 orderAmount_,
-        uint256 rng_,
-        uint256 odds_,
-        bool win_,
-        address token_,
-        uint256 tokenId_,
-        uint256 protocolFeesPaid,
-        bytes32 digest
+    /// @notice Internal function to set the flat fee
+    /// @param flatFee_ New flat fee value
+    function _setFlatFee(uint256 flatFee_) internal {
+        uint256 oldFlatFee = flatFee;
+        flatFee = flatFee_;
+        emit FlatFeeUpdated(oldFlatFee, flatFee_);
+    }
+
+    /// @notice Internal function to transfer the fee receiver manager role
+    /// @param newFeeReceiverManager_ New fee receiver manager address
+    function _transferFeeReceiverManager(
+        address newFeeReceiverManager_
     ) internal {
-        // execute the market data to transfer the nft
-        bool success = _fulfillOrder(marketplace_, orderData_, orderAmount_);
-        if (success) {
-            // subtract the order amount from the contract balance
-            treasuryBalance -= orderAmount_;
-            // emit a success transfer for the nft
-            emit Fulfillment(
-                msg.sender,
-                commitData.id,
-                rng_,
-                odds_,
-                win_,
-                token_,
-                tokenId_,
-                orderAmount_,
-                commitData.receiver,
-                protocolFeesPaid,
-                digest
-            );
-        } else {
-            // The order failed to fulfill, it could be bought already or invalid, make the best effort to send the user the value of the order they won.
-            treasuryBalance -= orderAmount_;
-
-            // This can also revert if the receiver is a contract that doesn't accept ETH
-            (bool success, ) = commitData.receiver.call{value: orderAmount_}(
-                ""
-            );
-            if (!success) revert TransferFailed();
-
-            emit Fulfillment(
-                msg.sender,
-                commitData.id,
-                rng_,
-                odds_,
-                win_,
-                address(0),
-                0,
-                orderAmount_,
-                commitData.receiver,
-                protocolFeesPaid,
-                digest
-            );
-        }
+        _revokeRole(FEE_RECEIVER_MANAGER_ROLE, msg.sender);
+        _grantRole(FEE_RECEIVER_MANAGER_ROLE, newFeeReceiverManager_);
+        emit FeeReceiverManagerTransferred(msg.sender, newFeeReceiverManager_);
     }
 
-    /// @notice Allows the admin to withdraw ETH from the contract balance
-    /// @param amount The amount of ETH to withdraw
-    /// @dev Only callable by admin role
-    /// @dev Emits a Withdrawal event
-    function withdraw(
-        uint256 amount
-    ) external nonReentrant onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (amount > treasuryBalance) revert InsufficientBalance();
-        treasuryBalance -= amount;
-
-        (bool success, ) = payable(feeReceiver).call{value: amount}("");
-        if (!success) revert WithdrawalFailed();
-
-        emit Withdrawal(msg.sender, amount, feeReceiver);
+    /// @notice Internal function to set the fee receiver
+    /// @param feeReceiver_ New fee receiver address
+    function _setFeeReceiver(address feeReceiver_) internal {
+        if (feeReceiver_ == address(0)) revert InvalidFeeReceiver();
+        if (hasRole(FEE_RECEIVER_MANAGER_ROLE, feeReceiver_))
+            revert InvalidFeeReceiverManager();
+        address oldFeeReceiver = feeReceiver;
+        feeReceiver = payable(feeReceiver_);
+        emit FeeReceiverUpdated(oldFeeReceiver, feeReceiver_);
     }
 
-    /// @notice Allows the admin to withdraw all ETH from the contract
-    /// @dev Only callable by admin role
-    /// @dev Emits a Withdrawal event
-    function emergencyWithdraw()
-        external
-        nonReentrant
-        onlyRole(DEFAULT_ADMIN_ROLE)
-    {
-        treasuryBalance = 0;
-        commitBalance = 0;
-        protocolBalance = 0;
-
-        uint256 currentBalance = address(this).balance;
-
-        (bool success, ) = payable(feeReceiver).call{value: currentBalance}("");
-        if (!success) revert WithdrawalFailed();
-
-        _pause();
-        emit Withdrawal(msg.sender, currentBalance, feeReceiver);
-    }
-
-    /// @notice Allows the commit owner to expire a commit in the event that the commit is not or cannot be fulfilled
-    /// @param commitId_ ID of the commit to expire
-    /// @dev Only callable by the commit owner
-    /// @dev Emits a CommitExpired event
-    function expire(
-        uint256 commitId_
-    ) external onlyCommitOwnerOrCosigner(commitId_) nonReentrant {
-        if (commitId_ >= luckyBuys.length) revert InvalidCommitId();
-        if (isFulfilled[commitId_]) revert AlreadyFulfilled();
-        if (isExpired[commitId_]) revert CommitIsExpired();
-        if (block.timestamp < commitExpiresAt[commitId_])
-            revert CommitNotExpired();
-
-        isExpired[commitId_] = true;
-
-        CommitData memory commitData = luckyBuys[commitId_];
-
-        uint256 commitAmount = commitData.amount;
-        commitBalance -= commitAmount;
-
-        uint256 protocolFeesPaid = feesPaid[commitId_];
-        protocolBalance -= protocolFeesPaid;
-
-        uint256 transferAmount = commitAmount + protocolFeesPaid;
-
-        (bool success, ) = payable(commitData.receiver).call{
-            value: transferAmount
-        }("");
-        if (!success) revert TransferFailed();
-
-        emit CommitExpired(commitId_, hash(commitData));
-    }
-
-    /// @notice Calculates contribution amount after removing fee
-    /// @param amount The original amount including fee
-    /// @return The contribution amount without the fee
-    /// @dev Uses formula: contribution = (amount * FEE_DENOMINATOR) / (FEE_DENOMINATOR + feePercent)
-    /// @dev This ensures fee isn't charged on the fee portion itself
-    function calculateContributionWithoutFee(
-        uint256 amount
-    ) public view returns (uint256) {
-        return (amount * BASE_POINTS) / (BASE_POINTS + protocolFee);
-    }
-
-    function onERC1155Received(
-        address operator,
-        address from,
-        uint256 id,
-        uint256 value,
-        bytes calldata data
-    ) external returns (bytes4) {
-        return this.onERC1155Received.selector;
-    }
-
-    // ############################################################
-    // ############ MANAGEMENT ############
-    // ############################################################
-
-    function transferOpenEditionContractOwnership(
-        address newOwner
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        address oldOwner = IERC1155MInitializableV1_0_2(openEditionToken)
-            .owner();
-        IERC1155MInitializableV1_0_2(openEditionToken).transferOwnership(
-            newOwner
-        );
-
-        _setOpenEditionToken(
-            openEditionToken,
-            openEditionTokenId,
-            openEditionTokenAmount
-        );
-
-        emit OpenEditionContractTransferred(oldOwner, newOwner);
-    }
-
-    // ############################################################
-    // ############ GETTERS & SETTERS ############
-    // ############################################################
-
-    /// @notice Sets the open edition token. We allow address(0) here.
+    /// @notice Internal function to set the open edition token
     /// @param token_ Address of the open edition token
     /// @param tokenId_ ID of the open edition token
-    /// @param amount_ Amount of the open edition token. The OE interface forces us to use uint32
-    /// @dev Only callable by ops role
-    function setOpenEditionToken(
-        address token_,
-        uint256 tokenId_,
-        uint32 amount_
-    ) external onlyRole(OPS_ROLE) {
-        _setOpenEditionToken(token_, tokenId_, amount_);
-    }
-
+    /// @param amount_ Amount of the open edition token
     function _setOpenEditionToken(
         address token_,
         uint256 tokenId_,
@@ -730,97 +978,14 @@ contract LuckyBuy is
         );
     }
 
-    /// @notice Adds a new authorized cosigner
-    /// @param cosigner_ Address to add as cosigner
-    /// @dev Only callable by admin role
-    /// @dev Emits a CoSignerAdded event
-    function addCosigner(
-        address cosigner_
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (cosigner_ == address(0)) revert InvalidCosigner();
-        if (isCosigner[cosigner_]) revert AlreadyCosigner();
-        isCosigner[cosigner_] = true;
-        emit CosignerAdded(cosigner_);
-    }
-
-    /// @notice Removes an authorized cosigner
-    /// @param cosigner_ Address to remove as cosigner
-    /// @dev Only callable by admin role
-    /// @dev Emits a CoSignerRemoved event
-    function removeCosigner(
-        address cosigner_
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (!isCosigner[cosigner_]) revert InvalidCosigner();
-        isCosigner[cosigner_] = false;
-        emit CosignerRemoved(cosigner_);
-    }
-
-    /// @notice Sets the commit expire time.
-    /// @param commitExpireTime_ New commit expire time
-    /// @dev Only callable by admin role
-    /// @dev Emits a CommitExpireTimeUpdated event
-    function setCommitExpireTime(
-        uint256 commitExpireTime_
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (commitExpireTime_ < MIN_COMMIT_EXPIRE_TIME)
-            revert InvalidCommitExpireTime();
-        uint256 oldCommitExpireTime = commitExpireTime;
-        commitExpireTime = commitExpireTime_;
-        emit CommitExpireTimeUpdated(oldCommitExpireTime, commitExpireTime_);
-    }
-
-    /// @notice Sets the maximum allowed reward
-    /// @param maxReward_ New maximum reward value
-    /// @dev Only callable by admin role
-    function setMaxReward(uint256 maxReward_) external onlyRole(OPS_ROLE) {
-        if (maxReward_ < minReward) revert InvalidReward();
-
-        uint256 oldMaxReward = maxReward;
-        maxReward = maxReward_;
-        emit MaxRewardUpdated(oldMaxReward, maxReward_);
-    }
-
-    /// @notice Sets the minimum allowed reward
-    /// @param minReward_ New minimum reward value
-    /// @dev Only callable by admin role
-    function setMinReward(
-        uint256 minReward_
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (minReward_ > maxReward) revert InvalidReward();
-        if (minReward_ < BASE_POINTS) revert InvalidReward();
-
-        uint256 oldMinReward = minReward;
-        minReward = minReward_;
-
-        emit MinRewardUpdated(oldMinReward, minReward_);
-    }
-
-    /// @notice Deposits ETH into the treasury
-    /// @dev Called internally when receiving ETH
+    /// @notice Internal function to deposit ETH into the treasury
     /// @param amount Amount of ETH to deposit
     function _depositTreasury(uint256 amount) internal {
         treasuryBalance += amount;
         emit Deposit(msg.sender, amount);
     }
 
-    /// @notice Pauses the contract
-    /// @dev Only callable by admin role
-    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _pause();
-    }
-
-    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _unpause();
-    }
-
-    /// @notice Handles receiving ETH
-    /// @dev Required for contract to receive ETH
-    receive() external payable {
-        _depositTreasury(msg.value);
-    }
-
-    /// @notice Calculates the odds of winning based on amount and reward
-    /// @dev Internal function used in fulfill()
+    /// @notice Internal function to calculate odds
     /// @param amount Amount committed
     /// @param reward Potential reward
     /// @return odds The calculated odds as a percentage (0-100)
@@ -831,77 +996,38 @@ contract LuckyBuy is
         return (amount * BASE_POINTS) / reward;
     }
 
-    /// @notice Fulfills an order with the specified parameters
-    /// @dev Internal function called by fulfill()
-    /// @param to Address to send the transaction to
-    /// @param data Calldata for the transaction
-    /// @param amount Amount of ETH to send
-    /// @return success Whether the transaction was successful
-    function _fulfillOrder(
-        address to,
-        bytes calldata data,
+    // ============ View Functions ============
+    /// @notice Calculates contribution amount after removing fee
+    /// @param amount The original amount including fee
+    /// @return The contribution amount without the fee
+    function calculateContributionWithoutFee(
         uint256 amount
-    ) internal returns (bool success) {
-        (success, ) = to.call{value: amount}(data);
+    ) public view returns (uint256) {
+        return (amount * BASE_POINTS) / (BASE_POINTS + protocolFee);
     }
 
-    function setProtocolFee(uint256 protocolFee_) external onlyRole(OPS_ROLE) {
-        _setProtocolFee(protocolFee_);
+    // ============ Receive Function ============
+    /// @notice Handles receiving ETH
+    /// @dev Required for contract to receive ETH
+    receive() external payable {
+        _depositTreasury(msg.value);
     }
 
-    function _setProtocolFee(uint256 protocolFee_) internal {
-        if (protocolFee_ > BASE_POINTS) revert InvalidProtocolFee();
-        uint256 oldProtocolFee = protocolFee;
-        protocolFee = protocolFee_;
-        emit ProtocolFeeUpdated(oldProtocolFee, protocolFee_);
-    }
-
-    /// @notice Sets the flat fee. Is a static amount that comes off the top of the commit amount.
-    /// @param flatFee_ New flat fee
-    /// @dev Only callable by ops role
-    /// @dev Emits a FlatFeeUpdated event
-    function setFlatFee(uint256 flatFee_) external onlyRole(OPS_ROLE) {
-        _setFlatFee(flatFee_);
-    }
-
-    function _setFlatFee(uint256 flatFee_) internal {
-        uint256 oldFlatFee = flatFee;
-        flatFee = flatFee_;
-        emit FlatFeeUpdated(oldFlatFee, flatFee_);
-    }
-
-    function transferFeeReceiverManager(
-        address newFeeReceiverManager_
-    ) external onlyRole(FEE_RECEIVER_MANAGER_ROLE) {
-        if (newFeeReceiverManager_ == address(0))
-            revert InvalidFeeReceiverManager();
-        _transferFeeReceiverManager(newFeeReceiverManager_);
-    }
-
-    function _transferFeeReceiverManager(
-        address newFeeReceiverManager_
-    ) internal {
-        _revokeRole(FEE_RECEIVER_MANAGER_ROLE, msg.sender);
-        _grantRole(FEE_RECEIVER_MANAGER_ROLE, newFeeReceiverManager_);
-        emit FeeReceiverManagerTransferred(msg.sender, newFeeReceiverManager_);
-    }
-
-    /// @notice Sets the fee receiver
-    /// @param feeReceiver_ Address to set as fee receiver
-    /// @dev Only callable by admin role
-    /// @dev Emits a FeeReceiverUpdated event
-    function setFeeReceiver(
-        address feeReceiver_
-    ) external onlyRole(FEE_RECEIVER_MANAGER_ROLE) {
-        _setFeeReceiver(feeReceiver_);
-    }
-
-    function _setFeeReceiver(address feeReceiver_) internal {
-        if (feeReceiver_ == address(0)) revert InvalidFeeReceiver();
-        if (hasRole(FEE_RECEIVER_MANAGER_ROLE, feeReceiver_))
-            revert InvalidFeeReceiverManager();
-        address oldFeeReceiver = feeReceiver;
-        feeReceiver = payable(feeReceiver_);
-        emit FeeReceiverUpdated(oldFeeReceiver, feeReceiver_);
+    // ============ ERC1155 Receiver Function ============
+    /// @notice Handles receiving ERC1155 tokens
+    /// @param operator Address that initiated the transfer
+    /// @param from Address that sent the tokens
+    /// @param id Token ID
+    /// @param value Amount of tokens
+    /// @param data Additional data
+    /// @return bytes4 The function selector
+    function onERC1155Received(
+        address operator,
+        address from,
+        uint256 id,
+        uint256 value,
+        bytes calldata data
+    ) external returns (bytes4) {
+        return this.onERC1155Received.selector;
     }
 }
